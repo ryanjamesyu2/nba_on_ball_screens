@@ -205,7 +205,7 @@ all_screens_df |>
 # filter out ball handler defenders with fewer than 10 plays
 all_screens_df <- all_screens_df |> 
   group_by(screen_bhd) |> 
-  filter(n() >= 20) |> 
+  filter(n() >= 10) |> 
   ungroup()
 
 length(unique(all_screens_df$screen_scrd))
