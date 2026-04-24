@@ -1,0 +1,617 @@
+---
+title: "36-460/660 Final Project Code"
+author: "Ryan Yu"
+date: 04/28/2026
+format: pdf
+---
+
+# Loading Data
+
+```{r warning=FALSE, message=FALSE}
+library(tidyverse)
+library(brms)
+library(ggridges)
+library(bayesplot)
+library(fuzzyjoin)
+```
+
+```{r}
+all_screens_df <- read_csv("data/all_screens.csv")
+```
+
+## EDA
+
+```{r}
+# Screens per player
+all_screens_df |> 
+  group_by(screener_id) |> 
+  summarise(n_screens = n()) |> 
+  ggplot() +
+  geom_histogram(aes(x=n_screens)) +
+  labs(x="Number of Screens", y="Count") +
+  theme_minimal()
+```
+
+```{r}
+# Shot location
+
+ggplot(all_screens_df) +
+  geom_point(aes(x=shot_loc_x, y=shot_loc_y), alpha=0.3)
+```
+
+```{r}
+all_screens_df |> 
+  mutate(
+    location_x_adj = ifelse(shot_loc_x > 50, 100 - shot_loc_x, shot_loc_x),
+    location_x_adj = location_x_adj * 47 / 50, # Rescale [0,50] to [0, 47]
+    location_y_adj = shot_loc_y * 50 / 100 # Rescale [0,100] to [0,50]
+    ) |> 
+  ggplot() +
+  geom_point(aes(x=location_y_adj, y=location_x_adj), alpha=0.2) +
+  coord_fixed() +
+  labs(x="", y="") +
+  theme_minimal()
+```
+
+```{r}
+# Number of ballhandlers per screener
+all_screens_df |> 
+  group_by(screener_id) |> 
+  summarize(n_bh = as.factor(n_distinct(screen_bh))) |> 
+  mutate(n_bh = factor(n_bh, levels=sort(as.numeric(levels(n_bh))))) |> 
+  ggplot() +
+  geom_bar(aes(x=n_bh)) +
+  labs(x="Number of Unique Ball Handlers", y="Count", title="Unique Ball Handlers for each Screener") +
+  theme_minimal()
+```
+
+```{r}
+# Number of screeners per ball handler
+all_screens_df |> 
+  group_by(screen_bh) |> 
+  summarize(n_screener = as.factor(n_distinct(screener_id))) |> 
+  mutate(n_screener = factor(n_screener, levels=sort(as.numeric(levels(n_screener))))) |> 
+  ggplot() +
+  geom_bar(aes(x=n_screener)) +
+  labs(x="Number of Screen Setters", y="Count", title="Unique Screen Setters for each Ball Handler") +
+  theme_minimal()
+```
+
+```{r}
+all_screens_df |> 
+  group_by(screen_type) |> 
+  summarize(sum=n())
+
+# condense everything but dho, drag, heavy, rub, an traditional to an "other" category
+```
+
+```{r}
+all_screens_df |> 
+  group_by(screen_location) |> 
+  summarize(sum=n())
+
+# Condense corner_3, in_paint, and short_corner to "Other"
+```
+
+```{r}
+all_screens_df |> 
+  group_by(screen_defense) |> 
+  summarize(sum=n())
+
+# Collapse get over/go under together, then collapse blitz, ice, jam, none to "Other"
+```
+
+```{r}
+all_screens_df |> 
+  group_by(shot_contest_type) |> 
+  summarize(sum=n())
+
+# Collapse kornet into "loose"
+```
+
+```{r}
+all_screens_df |> 
+  group_by(shot_type) |> 
+  summarize(sum=n())
+
+# Collapse dunk into layup, then face_up, heave, hook, hook_shot, lob into "Other"
+```
+
+```{r}
+# collapse fixed effect variables with a low number of observations
+all_screens_df <- all_screens_df |> 
+  mutate(
+    screen_type = ifelse(screen_type %in% c("dho", "rub", "drag", "heavy", "traditional"),
+                         screen_type, "other"),
+    screen_location = ifelse(screen_location %in% c("corner_3", "in_paint", "short_corner"),
+                             "other", screen_location),
+    screen_defense = ifelse(str_detect(screen_defense, "get_over"), "get_over",
+                            ifelse(str_detect(screen_defense, "go_under"), "go_under",
+                                   ifelse(screen_defense %in% c("blitz", "ice", "jam", "none"),
+                                          "other", screen_defense
+                                          )
+                                   )
+                            ),
+    shot_contest_type = ifelse(shot_contest_type == "kornet", "loose", shot_contest_type),
+    shot_type = ifelse(shot_type == "dunk", "layup",
+                       ifelse(shot_type %in% c("face_up", "heave", "hook", "hook_shot", "lob"),
+                              "other", shot_type))
+  )
+```
+
+```{r}
+# Distribution of plays per screener
+all_screens_df |> 
+  group_by(screener_id) |> 
+  summarize(n_obs = n()) |> 
+  ggplot() +
+  geom_histogram(aes(x=n_obs)) +
+  theme_minimal()
+
+# filter out screeners with fewer than 10 plays
+all_screens_df <- all_screens_df |> 
+  group_by(screener_id) |> 
+  filter(n() >= 10) |> 
+  ungroup()
+
+length(unique(all_screens_df$screener_id))
+```
+
+```{r}
+# Distribution of plays per ball handler
+all_screens_df |> 
+  group_by(screen_bh) |> 
+  summarize(n_obs = n()) |> 
+  ggplot() +
+  geom_histogram(aes(x=n_obs)) +
+  theme_minimal()
+
+# filter out ball handlers with fewer than 10 plays
+all_screens_df <- all_screens_df |> 
+  group_by(screen_bh) |> 
+  filter(n() >= 10) |> 
+  ungroup()
+
+length(unique(all_screens_df$screen_bh))
+```
+
+```{r}
+# Distribution of plays per screener defender
+all_screens_df |> 
+  group_by(screen_scrd) |> 
+  summarize(n_obs = n()) |> 
+  ggplot() +
+  geom_histogram(aes(x=n_obs)) +
+  theme_minimal()
+
+# filter out screener defenders with fewer than 10 plays
+all_screens_df <- all_screens_df |> 
+  group_by(screen_scrd) |> 
+  filter(n() >= 10) |> 
+  ungroup()
+
+length(unique(all_screens_df$screen_scrd))
+```
+
+```{r}
+# Distribution of plays per ball handler defender
+all_screens_df |> 
+  group_by(screen_bhd) |> 
+  summarize(n_obs = n()) |> 
+  ggplot() +
+  geom_histogram(aes(x=n_obs)) +
+  theme_minimal()
+
+# filter out ball handler defenders with fewer than 10 plays
+all_screens_df <- all_screens_df |> 
+  group_by(screen_bhd) |> 
+  filter(n() >= 20) |> 
+  ungroup()
+
+length(unique(all_screens_df$screen_scrd))
+```
+
+```{r}
+# Check multicollinearity
+# mm <- model.matrix(make ~ screen_defense + screen_type + screen_location + shot_distance + shot_type + shot_contest_type, data=all_screens_df)
+# 
+# corrs <- cor(mm[,-1])
+```
+
+## Response variable distributions 
+     
+```{r}
+all_screens_df |> 
+  ggplot() +
+  geom_histogram(aes(x=xpt))
+```
+
+```{r}
+all_screens_df |> 
+  mutate(make = as.factor(make)) |> 
+  ggplot() +
+  geom_bar(aes(x=make))
+```
+
+## Model Fitting
+
+```{r}
+# https://www.kaggle.com/datasets/reinerjasin/nba-2k25-player-complete-dataset?select=current_nba_players.csv
+nba2k_ratings <- read_csv("data/current_nba_players.csv")
+nba2k_ratings <- nba2k_ratings |> 
+  select(name, strength, ball_handle, help_defense_iq, perimeter_defense)
+
+player_id_map <- read_csv("data/player_id_map.csv")
+
+nba2k_ratings <- player_id_map |> 
+  stringdist_left_join(nba2k_ratings, by="name") |> 
+  select(-name.y) |> 
+  rename(name = name.x) |> 
+  mutate(
+    strength = replace_na(strength, mean(strength, na.rm = TRUE)),
+    ball_handle = replace_na(ball_handle, mean(ball_handle, na.rm = TRUE)),
+    help_defense_iq = replace_na(help_defense_iq, mean(help_defense_iq, na.rm = TRUE)),
+    perimeter_defense = replace_na(perimeter_defense, mean(perimeter_defense, na.rm = TRUE))
+  )
+
+# manually get rid of duplicate ids caused by fuzzy matching
+dup_inds <- c(47, 179, 188, 203, 275, 306, 322, 371, 461, 479)
+nba2k_ratings <- nba2k_ratings[-dup_inds, ]
+
+all_screens_df <- all_screens_df |> 
+  left_join(nba2k_ratings |> select(id, screener_rating = strength),
+            by=join_by(screener_id == id))
+
+all_screens_df <- all_screens_df |> 
+  left_join(nba2k_ratings |> select(id, bh_rating = ball_handle),
+            by=join_by(screen_bh == id))
+
+all_screens_df <- all_screens_df |> 
+  left_join(nba2k_ratings |> select(id, scrd_rating = help_defense_iq),
+            by=join_by(screen_scrd == id))
+
+all_screens_df <- all_screens_df |> 
+  left_join(nba2k_ratings |> select(id, bhd_rating = perimeter_defense),
+            by=join_by(screen_bhd == id))
+```
+
+```{r}
+all_screens_df <- all_screens_df |> 
+  mutate(
+    screener_id = as.factor(screener_id),
+    screen_bh = as.factor(screen_bh),
+    screen_scrd = as.factor(screen_scrd),
+    screen_bhd = as.factor(screen_bhd),
+    shot_distance = (shot_distance - mean(shot_distance)) / sd(shot_distance)
+  )
+
+all_screens_df <- all_screens_df |>
+  mutate(fold = sample(c("train", "test"), n(), replace = TRUE, 
+                       prob = c(.8, .2)))
+train_data <- all_screens_df |>
+  filter(fold == "train")
+test_data <- all_screens_df |>
+  filter(fold == "test")
+```
+
+```{r}
+screen_make_model <- brm(make ~ 1 + screen_defense + screen_type + screen_location +
+                          shot_distance + shot_type + shot_contest_type +
+                           screener_rating + bh_rating + scrd_rating + bhd_rating +
+                           (1 | screener_id) + (1 | screen_bh) + (1 | screen_scrd) + 
+                           (1 | screen_bhd), seed = 36660,
+                         family=bernoulli, data=train_data, iter=5000,
+                         cores = 12, backend="cmdstanr", file="brms_make_model_v2")
+```
+
+```{r}
+# screener_only_model <- brm(make ~ screen_defense + screen_type + screen_location +
+#                           shot_distance + shot_type + shot_contest_type +
+#                            screener_rating + (1 | screener_id),
+#                          family=bernoulli, data=train_data, iter=2000,
+#                          cores = 12, backend="cmdstanr", file="screener_only_model")
+```
+
+# Read in saved data
+
+```{r}
+# screen_make_model <- read_rds("brms_make_model.rds")
+# make_posterior_sample <- as_tibble(screen_make_model)
+```
+
+```{r}
+screen_make_model <- read_rds("brms_make_model_v2.rds")
+make_posterior_sample <- as_tibble(screen_make_model)
+```
+
+# Check distribution of parameters
+
+```{r}
+plot(screen_make_model, variable = "^sd_", regex=TRUE)
+```
+
+```{r}
+pp_check(screen_make_model)
+```
+
+```{r}
+mcmc_trace(screen_make_model, pars = c("sd_screener_id__Intercept"))
+```
+
+# R hat and effective sample size
+
+```{R}
+hist(brms::rhat(screen_make_model), main="R hat Distribution", xlab="R hat")
+hist(neff_ratio(screen_make_model), main="Effective Sample Size Ratio Distribution", xlab="Effective Sample Size Ratio")
+```
+
+# ICC
+
+```{r}
+icc <- make_posterior_sample |> 
+  select(sd_screener_id__Intercept, sd_screen_bh__Intercept
+         #, sd_screen_scrd__Intercept, sd_screen_bhd__Intercept
+         ) |> 
+  mutate(level2 = sd_screener_id__Intercept^2 + sd_screen_bh__Intercept^2,
+         #+ sd_screen_scrd__Intercept^2 + sd_screen_bhd__Intercept^2,
+         ICC = level2 / (level2 + pi^2/3))
+
+ggplot(icc) +
+  geom_histogram(aes(x=ICC)) +
+  labs(y="Frequency", title="Distribution of ICC") +
+  theme_minimal()
+```
+
+```{r}
+library(performance)
+
+icc(screen_make_model)
+```
+
+# Variance distributions for different random effects levels
+
+```{r}
+sd_posteriors <- make_posterior_sample |> 
+  select(contains("sd_")) |> 
+  pivot_longer(everything(), 
+               names_to = "role", 
+               values_to = "estimate") |> 
+  # remove annoying text in these parameter names
+  mutate(role = ifelse(role == "sd_screener_id__Intercept", "Screener",
+                       ifelse(role == "sd_screen_bh__Intercept", "Ball Handler",
+                              ifelse(role == "sd_screen_scrd__Intercept", "Screener Defender", "Ball Handler Defender"))))
+
+sd_posteriors |>   
+  ggplot(aes(estimate, fill = role)) +
+  geom_histogram(alpha = 0.7, bins = 60, show.legend = FALSE) +
+  facet_wrap(~ role, nrow = 4) +
+  labs(x = "Within-player-role standard deviation estimate", y = "Frequency") + 
+  theme_minimal()
+```
+
+# Get top screen setters and overperformers
+
+```{r}
+screener_posterior <- make_posterior_sample |> 
+  select(matches("^r_screener_id"), "b_screener_rating")
+
+screener_posterior_means <- data.frame(
+  screener_id = as.numeric(str_sub(colnames(screener_posterior), 15, 19)),
+  posterior_mean = colMeans(screener_posterior) 
+) |> 
+  arrange(desc(posterior_mean))
+
+rownames(screener_posterior_means) <- NULL
+
+screener_posterior_means <- screener_posterior_means |> 
+  inner_join(player_id_map, by=join_by(screener_id == id))
+
+screener_top_bottom <- c(head(screener_posterior_means$name, 5),
+                   tail(screener_posterior_means$name, 5))
+
+screener_estimates <- screener_posterior |> 
+  pivot_longer(cols =-b_screener_rating, names_to = "screener_id", values_to = "estimate") |>  
+  mutate(screener_id = as.numeric(str_remove_all(screener_id, "r_screener_id\\[|,Intercept\\]"))) |> # clean up id column
+  inner_join(player_id_map, by=join_by(screener_id == id)) |> # filter and also get player names
+  mutate(name = fct_reorder(name, estimate, .fun = mean)) # order players by posterior mean
+
+screener_estimates <- screener_estimates |> 
+  left_join(nba2k_ratings |> select(id, strength), by=join_by(screener_id == id)) |> 
+  mutate(total_effect = b_screener_rating * strength + estimate)
+
+screener_total_means <- screener_estimates |> 
+  group_by(name) |> 
+  summarize(mean_total_effect = mean(total_effect)) |> 
+  arrange(desc(mean_total_effect))
+
+screener_total_top_bottom <- c(head(screener_total_means$name, 5),
+                              tail(screener_total_means$name, 5))
+
+screener_estimates |> 
+  filter(name %in% screener_total_top_bottom) |> 
+  mutate(name = fct_reorder(name, total_effect, .fun = mean)) |>  # order players by posterior mean
+  ggplot(aes(total_effect, name)) +
+  geom_density_ridges(fill = "lightgray", rel_min_height = 0.01,
+                      quantile_lines = TRUE, quantile_fun = mean) +
+  labs(x = "Screener total random effect", y = NULL, , title="Top and Bottom 5 Screen Setters") +
+  theme_minimal()
+```
+
+# Get top ball handlers and overperformers
+
+```{r}
+bh_posterior <- make_posterior_sample |> 
+  select(matches("^r_screen_bh"), "b_bh_rating")
+
+bh_posterior_means <- data.frame(
+  screen_bh = as.numeric(str_sub(colnames(bh_posterior), 13, 17)),
+  posterior_mean = colMeans(bh_posterior) 
+) |> 
+  arrange(desc(posterior_mean))
+
+rownames(bh_posterior_means) <- NULL
+
+bh_posterior_means <- bh_posterior_means |> 
+  inner_join(player_id_map, by=join_by(screen_bh == id))
+
+bh_top_bottom <- c(head(bh_posterior_means$name, 5),
+                   tail(bh_posterior_means$name, 5))
+
+bh_estimates <- bh_posterior |> 
+  pivot_longer(cols=-b_bh_rating, names_to = "screen_bh", values_to = "estimate") |>  
+  mutate(screen_bh = as.numeric(str_remove_all(screen_bh, "r_screen_bh\\[|,Intercept\\]"))) |> # clean up id column
+  inner_join(player_id_map, by=join_by(screen_bh == id)) |> # filter and also get player names
+  mutate(name = fct_reorder(name, estimate, .fun = mean)) # order players by posterior mean
+
+bh_estimates <- bh_estimates |> 
+  left_join(nba2k_ratings |> select(id, ball_handle), by=join_by(screen_bh == id)) |> 
+  mutate(total_effect = b_bh_rating * ball_handle + estimate)
+
+bh_total_means <- bh_estimates |> 
+  group_by(name) |> 
+  summarize(mean_total_effect = mean(total_effect)) |> 
+  arrange(desc(mean_total_effect))
+
+bh_total_top_bottom <- c(head(bh_total_means$name, 5),
+                              tail(bh_total_means$name, 5))
+
+bh_estimates |> 
+  filter(name %in% bh_total_top_bottom) |> 
+  mutate(name = fct_reorder(name, total_effect, .fun = mean)) |>  # order players by posterior mean
+  ggplot(aes(total_effect, name)) +
+  geom_density_ridges(fill = "lightgray", rel_min_height = 0.01,
+                      quantile_lines = TRUE, quantile_fun = mean) +
+  labs(x = "Ball Handler total random effect", y = NULL, , title="Top and Bottom 5 Ball Handlers") +
+  theme_minimal()
+```
+
+# Get top screener defenders and overperformers
+
+```{r}
+scrd_posterior <- make_posterior_sample |> 
+  select(matches("^r_screen_scrd"), "b_scrd_rating")
+
+scrd_posterior_means <- data.frame(
+  screen_scrd = as.numeric(str_sub(colnames(scrd_posterior), 15, 19)),
+  posterior_mean = colMeans(scrd_posterior) 
+) |> 
+  arrange(desc(posterior_mean))
+
+rownames(scrd_posterior_means) <- NULL
+
+scrd_posterior_means <- scrd_posterior_means |> 
+  inner_join(player_id_map, by=join_by(screen_scrd == id))
+
+scrd_top_bottom <- c(head(scrd_posterior_means$name, 5),
+                   tail(scrd_posterior_means$name, 5))
+
+scrd_estimates <- scrd_posterior |> 
+  pivot_longer(cols=-b_scrd_rating, names_to = "screen_scrd", values_to = "estimate") |>  
+  mutate(screen_scrd = as.numeric(str_remove_all(screen_scrd, "r_screen_scrd\\[|,Intercept\\]"))) |> # clean up id column
+  inner_join(player_id_map, by=join_by(screen_scrd == id)) |> # filter and also get player names
+  mutate(name = fct_reorder(name, estimate, .fun = mean),
+         name = fct_rev(name)) # order players by posterior mean
+
+scrd_estimates <- scrd_estimates |> 
+  left_join(nba2k_ratings |> select(id, help_defense_iq), by=join_by(screen_scrd == id)) |> 
+  mutate(total_effect = b_scrd_rating * help_defense_iq + estimate)
+
+scrd_total_means <- scrd_estimates |> 
+  group_by(name) |> 
+  summarize(mean_total_effect = mean(total_effect)) |> 
+  arrange(desc(mean_total_effect))
+
+scrd_total_top_bottom <- c(head(scrd_total_means$name, 5),
+                              tail(scrd_total_means$name, 5))
+
+scrd_estimates |> 
+  filter(name %in% scrd_total_top_bottom) |> 
+  mutate(name = fct_reorder(name, total_effect, .fun = mean),
+         name = fct_rev(name)) |>  # order players by posterior mean
+  ggplot(aes(total_effect, name)) +
+  geom_density_ridges(fill = "lightgray", rel_min_height = 0.01,
+                      quantile_lines = TRUE, quantile_fun = mean) +
+  labs(x = "Screener Defender total random effect", y = NULL, , title="Top and Bottom 5 Screener Defenders") +
+  theme_minimal()
+```
+
+# Get top ball handler defenders
+
+```{r}
+bhd_posterior <- make_posterior_sample |> 
+  select(matches("^r_screen_bhd"), "b_bhd_rating")
+
+bhd_posterior_means <- data.frame(
+  screen_bhd = as.numeric(str_sub(colnames(bhd_posterior), 14, 18)),
+  posterior_mean = colMeans(bhd_posterior) 
+) |> 
+  arrange(desc(posterior_mean))
+
+rownames(bhd_posterior_means) <- NULL
+
+bhd_posterior_means <- bhd_posterior_means |> 
+  inner_join(player_id_map, by=join_by(screen_bhd == id))
+
+bhd_top_bottom <- c(head(bhd_posterior_means$name, 5),
+                   tail(bhd_posterior_means$name, 5))
+
+bhd_estimates <- bhd_posterior |> 
+  pivot_longer(cols=-b_bhd_rating, names_to = "screen_bhd", values_to = "estimate") |>  
+  mutate(screen_bhd = as.numeric(str_remove_all(screen_bhd, "r_screen_bhd\\[|,Intercept\\]"))) |> # clean up id column
+  inner_join(player_id_map, by=join_by(screen_bhd == id)) |> # filter and also get player names
+  mutate(name = fct_reorder(name, estimate, .fun = mean),
+         name = fct_rev(name)) # order players by posterior mean
+
+bhd_estimates <- bhd_estimates |> 
+  left_join(nba2k_ratings |> select(id, perimeter_defense), by=join_by(screen_bhd == id)) |> 
+  mutate(total_effect = b_bhd_rating * perimeter_defense + estimate)
+
+bhd_total_means <- bhd_estimates |> 
+  group_by(name) |> 
+  summarize(mean_total_effect = mean(total_effect)) |> 
+  arrange(desc(mean_total_effect))
+
+bhd_total_top_bottom <- c(head(bhd_total_means$name, 5),
+                              tail(bhd_total_means$name, 5))
+
+bhd_estimates |> 
+  filter(name %in% bhd_total_top_bottom) |> 
+  mutate(name = fct_reorder(name, total_effect, .fun = mean),
+         name = fct_rev(name)) |>  # order players by posterior mean
+  ggplot(aes(total_effect, name)) +
+  geom_density_ridges(fill = "lightgray", rel_min_height = 0.01,
+                      quantile_lines = TRUE, quantile_fun = mean) +
+  labs(x = "Ball Handler Defender total random effect", y = NULL, , title="Top and Bottom 5 Ball Handler Defenders") +
+  theme_minimal()
+```
+
+# Accuracy
+
+```{r}
+make_logit <- glm(make ~ screen_defense + screen_type + screen_location +
+                          shot_distance + shot_type + shot_contest_type,
+                  data = train_data,
+                  family = binomial)
+
+make_logit_preds <- predict(make_logit, test_data)
+make_logit_preds <- ifelse(make_logit_preds > 0.5, 1, 0)
+logit_acc <- mean(make_logit_preds == test_data$make)
+```
+
+```{r}
+test_error_samples <- posterior_epred(screen_make_model, newdata = test_data,
+                                      allow_new_levels = TRUE)
+
+acc_basic <- apply(test_error_samples, 1, function(prob) {
+  yhat <- ifelse(prob > 0.5, 1, 0)
+  mean(yhat == test_data$make)
+})
+
+hist(acc_basic, main="Posterior Sample Accuracy Distribution", xlab="Accuracy")
+abline(v = logit_acc, col = "red", lty = 2, lwd=2)
+legend("topright", legend=c("Baseline Model Accuracy"), fill=c("red"))
+```
+
+```{r}
+ifelse(test_error_samples[1, ] > 0.5, 1, 0) |> as.factor() |> plot(main="Posterior Predictive Check")
+```

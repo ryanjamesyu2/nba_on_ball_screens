@@ -1,0 +1,202 @@
+---
+title: "Project Data Collection + EDA"
+author: "Ryan Yu"
+date: 04/24/2026
+format: pdf
+---
+
+# Loading Data
+
+```{r warning=FALSE, message=FALSE}
+library(tidyverse)
+library(arrow)
+```
+
+```{r, eval=FALSE}
+all_screens_df <- 
+  map_dfr(c("October", "November", "December"), 
+          function(m) {
+            actions <- read_parquet(paste0("data/", m, "/actions.parquet"))
+            advanced_stats <- read_parquet(paste0("data/", m, "/advanced_stats.parquet"))
+            charting_actions <- read_parquet(paste0("data/", m, "/charting_actions.parquet"))
+            charting_details <- read_parquet(paste0("data/", m, "/charting_details.parquet"))
+            conditions <- read_parquet(paste0("data/", m, "/conditions.parquet"))
+            plays <- read_parquet(paste0("data/", m, "/plays.parquet"))
+            
+            # Identify plays that have a screen, along with the screener and ball handler
+            screen_charting_actions <- charting_actions |>
+              filter(id2 == "screen") |> 
+              select(plays.id, screener_id = id, screen_type = id3, screen_location = id5)
+            
+            # Get the ball handler ID, BH defense ID, screener defender ID, defense on the play
+            screen_charting_details <- charting_details |> 
+              distinct() |> 
+              filter(plays.id %in% screen_charting_actions$plays.id) |> 
+              filter(str_detect(id2, "screen_")) |> 
+              select(plays.id, player_id = id, id2, id3) |> 
+              mutate(player_id = ifelse(player_id == 0, id3, player_id)) |> 
+              select(-c(id3)) |> 
+              pivot_wider(names_from = id2, values_from = player_id) |> 
+              mutate(
+                screen_bh = as.numeric(screen_bh),
+                screen_bhd = as.numeric(screen_bhd),
+                screen_scrd = as.numeric(screen_scrd)
+              )
+            
+            # Combine
+            screen_df <- screen_charting_actions |> 
+              inner_join(screen_charting_details, by=join_by(plays.id))
+            
+            # Get shot information, and filter to plays where shooter is either the screener
+            # or ball handler
+            screen_actions <- actions |> 
+              filter(plays.id %in% screen_charting_actions$plays.id) |> 
+              filter(str_detect(id3, "^fg")) |> 
+              select(plays.id, shooter_id = id2, fg_type = id3, shot_distance = distance, shot_loc_x = location_x, shot_loc_y = location_y)
+            
+            # Join
+            screen_df <- screen_df |> 
+              inner_join(screen_actions, by=join_by(plays.id))
+            
+            # Filter for plays where shooter is either screen setter or BH
+            screen_df <- screen_df |> 
+              filter((shooter_id == screener_id) | (shooter_id == screen_bh))
+            
+            # Join the shot condition variables
+            # Filter out observations (very few) where there are multiple values
+            #   for a given variable
+            screen_conditions <- conditions |> 
+              filter(plays.id %in% screen_df$plays.id) |> 
+              filter(id %in% c("shot_contest_type", "shot_type")) |> 
+              mutate(temp = paste(plays.id, id, sep="_")) |> 
+              add_count(temp) |> 
+              filter(n == 1) |> 
+              select(plays.id, variable = id, value = id1)
+            
+            # Pivot wider to be in correct format to join
+            screen_conditions_wide <- screen_conditions |> 
+              pivot_wider(names_from = variable, values_from = value)
+            
+            # Join
+            screen_df <- screen_df |> 
+              inner_join(screen_conditions_wide, by=join_by(plays.id)) |> 
+              drop_na()
+            
+            # Get 10 players on the court and other game context info
+            screen_plays <- plays |> 
+              filter(plays.id %in% screen_df$plays.id) |> 
+              select(plays.id, period, play_clock, play_duration, off1.id, off2.id, off3.id, 
+                     off4.id, off5.id, def1.id, def2.id, def3.id, def4.id, def5.id, points) |> 
+              mutate(make = ifelse(points > 0, 1, 0))
+            
+            # Join
+            screen_df <- screen_df |> 
+              inner_join(screen_plays, by=join_by(plays.id))
+            
+            # Get expected points for the play
+            screen_as <- advanced_stats |> 
+              filter(plays.id %in% screen_df$plays.id,
+                     stat == "xpt") |> 
+              select(plays.id, xpt = value)
+            
+            # Join
+            screen_df <- screen_df |> 
+              inner_join(screen_as, by=join_by(plays.id))
+            
+            screen_df
+          })
+
+write.csv(all_screens_df, "data/all_screens.csv", row.names = FALSE)
+```
+
+```{r}
+m <- "October"
+actions <- read_parquet(paste0("data/", m, "/actions.parquet"))
+advanced_stats <- read_parquet(paste0("data/", m, "/advanced_stats.parquet"))
+charting_actions <- read_parquet(paste0("data/", m, "/charting_actions.parquet"))
+charting_details <- read_parquet(paste0("data/", m, "/charting_details.parquet"))
+conditions <- read_parquet(paste0("data/", m, "/conditions.parquet"))
+plays <- read_parquet(paste0("data/", m, "/plays.parquet"))
+```
+
+```{r}
+all_screens_df <- read_csv("data/all_screens.csv")
+```
+
+```{r}
+player_id_map <- 
+  map_dfr(c("October", "November", "December"), 
+          function(m) {
+            charting_actions <- read_parquet(paste0("data/", m, "/charting_actions.parquet"))
+            
+            id_map <- charting_actions |> 
+              select(id, name) |> 
+              drop_na() |> 
+              distinct()
+            
+            id_map
+          })
+
+player_id_map <- distinct(player_id_map)
+
+write.csv(player_id_map, "data/player_id_map.csv", row.names = FALSE)
+```
+
+## EDA
+
+```{r}
+# Screens per player
+all_screens_df |> 
+  group_by(screener_id) |> 
+  summarise(n_screens = n()) |> 
+  ggplot() +
+  geom_histogram(aes(x=n_screens)) +
+  labs(x="Number of Screens", y="Count") +
+  theme_minimal()
+```
+
+```{r}
+# Shot location
+
+ggplot(all_screens_df) +
+  geom_point(aes(x=location_x, y=location_y), alpha=0.3)
+```
+
+```{r}
+all_screens_df |> 
+  mutate(
+    location_x_adj = ifelse(location_x > 50, 100 - location_x, location_x),
+    location_x_adj = location_x_adj * 47 / 50, # Rescale [0,50] to [0, 47]
+    location_y_adj = location_y * 50 / 100 # Rescale [0,100] to [0,50]
+    ) |> 
+  ggplot() +
+  geom_point(aes(x=location_y_adj, y=location_x_adj), alpha=0.2) +
+  coord_fixed() +
+  labs(x="", y="") +
+  theme_minimal()
+```
+
+```{r}
+# Number of ballhandlers per screener
+all_screens_df |> 
+  group_by(screener_id) |> 
+  summarize(n_bh = as.factor(n_distinct(bh_id))) |> 
+  mutate(n_bh = factor(n_bh, levels=sort(as.numeric(levels(n_bh))))) |> 
+  ggplot() +
+  geom_bar(aes(x=n_bh)) +
+  labs(x="Number of Unique Ball Handlers", y="Count", title="Unique Ball Handlers for each Screener") +
+  theme_minimal()
+```
+
+```{r}
+# Number of screeners per ball handler
+all_screens_df |> 
+  group_by(bh_id) |> 
+  summarize(n_screener = as.factor(n_distinct(screener_id))) |> 
+  mutate(n_screener = factor(n_screener, levels=sort(as.numeric(levels(n_screener))))) |> 
+  ggplot() +
+  geom_bar(aes(x=n_screener)) +
+  labs(x="Number of Screen Setters", y="Count", title="Unique Screen Setters for each Ball Handler") +
+  theme_minimal()
+```
+      
