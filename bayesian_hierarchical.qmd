@@ -151,7 +151,7 @@ all_screens_df |>
 # filter out screeners with fewer than 10 plays
 all_screens_df <- all_screens_df |> 
   group_by(screener_id) |> 
-  filter(n() >= 10) |> 
+  filter(n() >= 15) |> 
   ungroup()
 
 length(unique(all_screens_df$screener_id))
@@ -169,7 +169,7 @@ all_screens_df |>
 # filter out ball handlers with fewer than 10 plays
 all_screens_df <- all_screens_df |> 
   group_by(screen_bh) |> 
-  filter(n() >= 10) |> 
+  filter(n() >= 15) |> 
   ungroup()
 
 length(unique(all_screens_df$screen_bh))
@@ -187,7 +187,7 @@ all_screens_df |>
 # filter out screener defenders with fewer than 10 plays
 all_screens_df <- all_screens_df |> 
   group_by(screen_scrd) |> 
-  filter(n() >= 10) |> 
+  filter(n() >= 15) |> 
   ungroup()
 
 length(unique(all_screens_df$screen_scrd))
@@ -205,7 +205,7 @@ all_screens_df |>
 # filter out ball handler defenders with fewer than 10 plays
 all_screens_df <- all_screens_df |> 
   group_by(screen_bhd) |> 
-  filter(n() >= 10) |> 
+  filter(n() >= 15) |> 
   ungroup()
 
 length(unique(all_screens_df$screen_scrd))
@@ -285,6 +285,7 @@ all_screens_df <- all_screens_df |>
     shot_distance = (shot_distance - mean(shot_distance)) / sd(shot_distance)
   )
 
+set.seed(36660)
 all_screens_df <- all_screens_df |>
   mutate(fold = sample(c("train", "test"), n(), replace = TRUE, 
                        prob = c(.8, .2)))
@@ -301,7 +302,7 @@ screen_make_model <- brm(make ~ 1 + screen_defense + screen_type + screen_locati
                            (1 | screener_id) + (1 | screen_bh) + (1 | screen_scrd) + 
                            (1 | screen_bhd), seed = 36660,
                          family=bernoulli, data=train_data, iter=5000,
-                         cores = 12, backend="cmdstanr", file="brms_make_model_v2")
+                         cores = 12, backend="cmdstanr", file="brms_make_model_v3")
 ```
 
 ```{r}
@@ -320,7 +321,7 @@ screen_make_model <- brm(make ~ 1 + screen_defense + screen_type + screen_locati
 ```
 
 ```{r}
-screen_make_model <- read_rds("brms_make_model_v2.rds")
+screen_make_model <- read_rds("brms_make_model_v3.rds")
 make_posterior_sample <- as_tibble(screen_make_model)
 ```
 
