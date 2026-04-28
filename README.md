@@ -10,3 +10,5 @@ The file `screen_dataset_creation.qmd` contains the code used to read the raw da
 ## Models
 
 The `bayesian_hierarchical.qmd` was written by Ryan Yu. It contains additional EDA, as well as model fitting and comparison for the Bayesian Hierarchical model to predict the Bernoulli response of a shot going in or not.
+
+The `FrequentistHierarchichal.Rmd` was written by Pramit Vyas. It contains some EDA, as well as model fitting for the Frequentist Hierarchichal Model to predict the Bernoulli of shot going in or not and then transforming that to predicted EPA.
