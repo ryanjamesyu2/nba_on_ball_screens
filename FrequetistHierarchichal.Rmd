@@ -1,0 +1,827 @@
+---
+title: "SportsProjectWork"
+author: "Pramit Vyas"
+date: "2026-04-08"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{R}
+library(arrow)
+library(dplyr)
+library(purrr)
+
+# 1. Define your months/folders
+months <- c("October", "November", "December")
+
+# 2. Identify the 7 unique file names (assuming they are the same in all folders)
+# We'll use December as the template
+file_names <- list.files(path = "December", pattern = "\\.parquet$")
+
+# 3. Create the 7 combined dataframes
+# We loop through each file name, read it from every folder, and bind them
+combined_data <- map(file_names, function(file) {
+  
+  # Construct paths for this specific file across all months
+  paths <- file.path(months, file)
+  
+  # Read and stack them
+  # map_df automatically rbinds the results into one dataframe
+  map_df(paths, read_parquet)
+})
+
+# 4. Name the list elements so you can access them easily
+# e.g., combined_data$players.parquet
+names(combined_data) <- file_names
+
+# 5. (Optional) Bring them into the global environment as individual objects
+# This creates 7 dataframes in your environment named after the files
+list2env(combined_data, .GlobalEnv)
+
+# Verify the results
+cat("Combined dataframes created:", paste(names(combined_data), collapse = ", "))
+
+```
+
+
+```{R}
+advanced_stats = combined_data[[2]]
+conditions = combined_data[[5]]
+plays = combined_data[[6]]
+stats = combined_data[[7]]
+
+plays
+
+ids_to_name = advanced_stats %>% distinct(name, id)
+
+nrow(plays)
+```
+
+```{R}
+stats_and_plays = stats %>% left_join(plays, by = c("plays.id" = "plays.id"))
+
+conditions %>% head(1000) %>% write.csv("conditions.csv")
+```
+
+
+```{R}
+
+library(tidyverse)
+
+
+# 2. Extract Play-Level Base Data (Lineups and Scores)
+# We take distinct play_ids to ensure one row per play
+play_base <- stats_and_plays %>%
+  select(
+    play_id = `plays.id`,
+    away_score,
+    home_score,
+    # Lineup IDs
+    off1.id, off2.id, off3.id, off4.id, off5.id,
+    def1.id, def2.id, def3.id, def4.id, def5.id
+  ) %>%
+  distinct(play_id, .keep_all = TRUE)
+
+# 3. Extract Shot Clock Information
+# Filtering for the 'short_clock' identifier in the conditions table
+shot_clock_info <- conditions %>%
+  filter(id == "short_clock") %>%
+  select(play_id = `plays.id`, shot_clock_status = description) %>%
+  distinct(play_id, .keep_all = TRUE)
+
+# 4. Extract Expected Points (xPts)
+# Filtering for the 'xpt' stat in the advanced_stats table
+expected_pts_info <- advanced_stats %>%
+  filter(stat == "xpt") %>%
+  select(play_id = `plays.id`, expectedPts = value) %>%
+  distinct(play_id, .keep_all = TRUE)
+
+
+pramit_dataset <- play_base %>%
+  left_join(shot_clock_info, by = "play_id") %>%
+  left_join(expected_pts_info, by = "play_id") %>%
+  # Organize columns for the final model
+  select(
+    play_id,
+    away_score,
+    home_score,
+    shot_clock_status,
+    expectedPts,
+    starts_with("off"),
+    starts_with("def")
+  )
+
+# Preview the result
+print(head(pramit_dataset))
+
+pramit_dataset %>% write.csv("gen_info_plays.csv")
+# Export the final dataset
+# write_csv(pramit_dataset, "pramit_overall_statistics.csv")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{R}
+pramit_dataset %>% filter(is.na(expectedPts))
+```
+
+
+```{R}
+all_screens = read.csv("all_screens.csv")
+all_screens = all_screens %>% filter(!(shot_type %in% c("heave", "hook")) & screen_defense != "None")
+
+all_screens %>% pull(screen_type) %>% table()
+```
+
+
+
+## Mixed Effects Model
+
+```{R}
+library(lme4)
+all_screens$screener_id <- as.factor(all_screens$screener_id)
+all_screens$screen_bh   <- as.factor(all_screens$screen_bh)
+all_screens$screen_bhd  <- as.factor(all_screens$screen_bhd)
+all_screens$screen_scrd <- as.factor(all_screens$screen_scrd)
+all_screens$shot_type <- as.factor(all_screens$shot_type)
+all_screens$shot_contest_type <- as.factor(all_screens$shot_contest_type)
+all_screens$screen_defense <- as.factor(all_screens$screen_defense)
+all_screens$make = as.factor(all_screens$make)
+screen_model <- glmer(make ~ shot_distance + screen_type + screen_defense + shot_contest_type +
+              (1 | screener_id) + 
+              (1 | screen_bh) + 
+              (1 | screen_bhd) + 
+              (1 | screen_scrd), 
+              data = all_screens, 
+              family = binomial(link = "logit"),
+              nAGQ = 0, 
+              control = glmerControl(optimizer = "bobyqa"))
+
+screen_model %>% summary()
+```
+
+##New Approach rankings
+
+```{R}
+library(dplyr)
+library(lme4)
+advanced_stats = combined_data[[2]]
+ids_to_name = advanced_stats %>% distinct(name, id)
+all_effects <- ranef(screen_model)
+# 1. Prepare player-specific shot values
+# Create a helper function to get the average shot value for each role
+get_player_avg_value <- function(role_name) {
+  col_name <- role_name
+  
+  all_screens %>%
+    group_by(player_id = as.character(.data[[col_name]])) %>%
+    summarise(avg_shot_value = mean(ifelse(fg_type == "fg3", 3, 2), na.rm = TRUE), .groups = 'drop')
+}
+
+# 2. Update ranking function to use specific weights
+get_epa_rankings <- function(role_name, sort_desc = TRUE) {
+  # Get global intercept
+  global_intercept <- fixef(screen_model)["(Intercept)"]
+  
+  # Get player specific average shot values
+  player_values <- get_player_avg_value(role_name)
+  
+  # Build base dataframe - ensure player_id is character to match the join
+  df_role <- data.frame(
+    player_id = as.character(rownames(all_effects[[role_name]])),
+    random_effect = all_effects[[role_name]][["(Intercept)"]],
+    stringsAsFactors = FALSE
+  )
+  
+  # Merge with values
+  # Explicitly convert player_values$player_id to character just in case
+  df_role <- df_role %>%
+    mutate(player_id = as.character(player_id)) %>%
+    left_join(player_values %>% mutate(player_id = as.character(player_id)), by = "player_id") %>%
+    mutate(
+      baseline_prob = plogis(global_intercept),
+      player_prob = plogis(global_intercept + random_effect),
+      prob_lift = player_prob - baseline_prob,
+      expected_points_added = prob_lift * avg_shot_value
+    )
+  
+  if(sort_desc) {
+    return(df_role[order(-df_role$expected_points_added), ])
+  } else {
+    return(df_role[order(df_role$expected_points_added), ])
+  }
+}
+
+# 3. Generate rankings
+rankings_screener <- get_epa_rankings("screener_id", sort_desc = TRUE)
+rankings_bh <- get_epa_rankings("screen_bh", sort_desc = TRUE)
+rankings_bhd <- get_epa_rankings("screen_bhd", sort_desc = FALSE) # Lower is better for defenders
+rankings_scrd <- get_epa_rankings("screen_scrd", sort_desc = FALSE)
+
+# 4. Join with names
+ids_to_name = ids_to_name %>% mutate(id = as.factor(id))
+rankings_screener <- rankings_screener %>% left_join(ids_to_name, by = c("player_id" = "id"))
+rankings_bh <- rankings_bh %>% left_join(ids_to_name, by = c("player_id" = "id"))
+rankings_bhd <- rankings_bhd %>% left_join(ids_to_name, by = c("player_id" = "id"))
+rankings_scrd <- rankings_scrd %>% left_join(ids_to_name, by = c("player_id" = "id"))
+
+rankings_bh %>% colnames()
+```
+
+```{R}
+library(ggplot2)
+library(ggrepel)
+library(ggExtra)
+combined_epa <- rankings_bh %>%
+  select(player_id, name, epa_bh = expected_points_added) %>%
+  inner_join(rankings_screener %>% select(player_id, epa_screener = expected_points_added), by = "player_id")
+
+# 2. Identify the IDs to label
+# Get Top 5 / Bottom 5 for BH
+top_bh <- combined_epa %>% slice_max(epa_bh, n = 5) %>% pull(player_id)
+bot_bh <- combined_epa %>% slice_min(epa_bh, n = 5) %>% pull(player_id)
+
+# Get Top 5 / Bottom 5 for Screener
+top_scr <- combined_epa %>% slice_max(epa_screener, n = 5) %>% pull(player_id)
+bot_scr <- combined_epa %>% slice_min(epa_screener, n = 5) %>% pull(player_id)
+
+# Specific players to highlight
+highlight_names <- c("Draymond Green", "Stephen Curry", "LeBron James", "Jaylen Brown", "Jalen Duren")
+
+# 3. Create a label column
+combined_epa <- combined_epa %>%
+  mutate(label = case_when(
+    player_id %in% c(top_bh, bot_bh, top_scr, bot_scr) ~ name,
+    name %in% highlight_names ~ name,
+    TRUE ~ NA_character_
+  ))
+
+# 4. Generate the plot
+p <- ggplot(combined_epa, aes(x = epa_screener, y = epa_bh)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey") +
+  geom_text_repel(aes(label = label), size = 3, max.overlaps = Inf) +
+  theme_minimal() +
+  labs(
+    title = "Expected Points Added: Ball Handler vs. Screener",
+    x = "Screener EPA",
+    y = "Ball Handler EPA"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+# 5. Add marginal histograms
+ggExtra::ggMarginal(p, type = "histogram", bins = 30, fill = "steelblue", color = "white")
+```
+
+```{R}
+
+get_epa_rankings_with_ci <- function(role_name) {
+  # 1. Setup
+  global_intercept <- fixef(screen_model)["(Intercept)"]
+  player_values <- get_player_avg_value(role_name)
+  
+  # Extract BLUPs and conditional variances
+  # postVar is [1, 1, N], so we take [1, 1, ]
+  random_effects <- all_effects[[role_name]][["(Intercept)"]]
+  conditional_vars <- attr(all_effects[[role_name]], "postVar")[1, 1, ]
+  
+  # 2. Build data frame
+  df_role <- data.frame(
+    player_id = as.character(rownames(all_effects[[role_name]])),
+    random_effect = random_effects,
+    se_eta = sqrt(conditional_vars),
+    stringsAsFactors = FALSE
+  )
+  
+  # 3. Join with values and calculate EPA and SE
+  df_role <- df_role %>%
+    left_join(player_values %>% mutate(player_id = as.character(player_id)), by = "player_id") %>%
+    mutate(
+      baseline_prob = plogis(global_intercept),
+      player_prob = plogis(global_intercept + random_effect),
+      prob_lift = player_prob - baseline_prob,
+      expected_points_added = prob_lift * avg_shot_value,
+      # Delta method: SE = avg_value * p * (1-p) * SE_eta
+      se_epa = avg_shot_value * (player_prob * (1 - player_prob)) * se_eta,
+      lower_ci = expected_points_added - (1.96 * se_epa),
+      upper_ci = expected_points_added + (1.96 * se_epa)
+    )
+  
+  # 4. Filter top 5 and bottom 5
+  top_5 <- df_role %>% arrange(desc(expected_points_added)) %>% head(5) %>% mutate(rank_group = "Top 5")
+  bottom_5 <- df_role %>% arrange(expected_points_added) %>% head(5) %>% mutate(rank_group = "Bottom 5")
+  
+  return(bind_rows(top_5, bottom_5))
+}
+
+# Generate final reports for each role
+roles <- c("screener_id", "screen_bh", "screen_bhd", "screen_scrd")
+final_rankings <- lapply(roles, get_epa_rankings_with_ci)
+names(final_rankings) <- roles
+
+# Join with names for final output
+# Assuming ids_to_name is already a data frame with 'id' and 'name'
+final_rankings <- lapply(final_rankings, function(df) {
+  df %>% 
+    mutate(player_id = as.factor(player_id)) %>%
+    left_join(ids_to_name %>% mutate(id = as.factor(id)), by = c("player_id" = "id"))
+})
+```
+
+
+
+```{R}
+library(performance)
+
+# Calculate ICC for all random effects
+icc_results <- icc(screen_model)
+
+# Print results
+print(icc_results)
+
+# Extract variance components
+var_comp <- as.data.frame(VarCorr(screen_model))
+
+# Residual variance for logit link is pi^2 / 3
+residual_var <- (pi^2) / 3
+
+# Filter to get only the random effects variance
+random_effect_vars <- var_comp %>%
+  filter(grp != "Residual") %>%
+  select(grp, vcov)
+
+# Calculate total variance (sum of random effect variances + residual variance)
+total_variance <- sum(random_effect_vars$vcov) + residual_var
+
+# Calculate ICC for each group
+icc_distribution <- random_effect_vars %>%
+  mutate(icc = vcov / total_variance) %>%
+  select(grp, icc)
+
+# Display the distribution of variance
+print(icc_distribution)
+
+library(ggplot2)
+
+ggplot(icc_distribution, aes(x = grp, y = icc)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Variance Partitioning (ICC) by Role",
+       x = "Random Effect Group",
+       y = "Proportion of Variance Explained")
+```
+ 
+```{R}
+
+plot_data <- bind_rows(
+  rankings_screener %>% mutate(role = "Screener"),
+  rankings_bh %>% mutate(role = "Ball Handler"),
+  rankings_bhd %>% mutate(role = "BH Defender"),
+  rankings_scrd %>% mutate(role = "Screen Defender")
+)
+ggplot(plot_data, aes(x = prob_lift, fill = role)) +
+  geom_histogram(bins = 40, color = "white", alpha = 0.7) +
+  facet_wrap(~role, scales = "free") +
+  theme_minimal() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  labs(
+    title = "Distribution of Probability Lift by Role",
+    x = "Probability Lift",
+    y = "Frequency"
+  ) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    strip.text = element_text(size = 12, face = "bold"),
+    legend.position = "none"
+  )
+
+
+```
+
+
+
+
+```{R}
+
+post_var <- attr(all_effects$screener_id, "postVar")
+
+
+se_screener <- sqrt(post_var[1, 1, ])
+
+
+rankings_screener_uncertainty <- data.frame(
+  player_id = as.character(rownames(all_effects$screener_id)),
+  estimate = all_effects$screener_id$"(Intercept)",
+  se = se_screener
+) %>%
+  mutate(
+    lower_ci = estimate - (1.96 * se),
+    upper_ci = estimate + (1.96 * se)
+  )
+
+# Join with player names to maintain context
+rankings_screener_uncertainty <- rankings_screener_uncertainty %>%
+  left_join(ids_to_name, by = c("player_id" = "id"))
+```
+
+
+```{R}
+get_epa_rankings_with_ci <- function(role_name) {
+  # 1. Setup
+  global_intercept <- fixef(screen_model)["(Intercept)"]
+  player_values <- get_player_avg_value(role_name)
+  
+  # Extract BLUPs and conditional variances
+  # postVar is [1, 1, N], so we take [1, 1, ]
+  random_effects <- all_effects[[role_name]][["(Intercept)"]]
+  conditional_vars <- attr(all_effects[[role_name]], "postVar")[1, 1, ]
+  
+  # 2. Build data frame
+  df_role <- data.frame(
+    player_id = as.character(rownames(all_effects[[role_name]])),
+    random_effect = random_effects,
+    se_eta = sqrt(conditional_vars),
+    stringsAsFactors = FALSE
+  )
+  
+  # 3. Join with values and calculate EPA and SE
+  df_role <- df_role %>%
+    left_join(player_values %>% mutate(player_id = as.character(player_id)), by = "player_id") %>%
+    mutate(
+      baseline_prob = plogis(global_intercept),
+      player_prob = plogis(global_intercept + random_effect),
+      prob_lift = player_prob - baseline_prob,
+      expected_points_added = prob_lift * avg_shot_value,
+      # Delta method: SE = avg_value * p * (1-p) * SE_eta
+      se_epa = avg_shot_value * (player_prob * (1 - player_prob)) * se_eta,
+      lower_ci = expected_points_added - (1.96 * se_epa),
+      upper_ci = expected_points_added + (1.96 * se_epa)
+    )
+  
+  # 4. Filter top 5 and bottom 5
+  top_5 <- df_role %>% arrange(desc(expected_points_added)) %>% head(5) %>% mutate(rank_group = "Top 5")
+  bottom_5 <- df_role %>% arrange(expected_points_added) %>% head(5) %>% mutate(rank_group = "Bottom 5")
+  
+  return(bind_rows(top_5, bottom_5))
+}
+
+# Generate final reports for each role
+roles <- c("screener_id", "screen_bh", "screen_bhd", "screen_scrd")
+final_rankings <- lapply(roles, get_epa_rankings_with_ci)
+names(final_rankings) <- roles
+
+# Join with names for final output
+# Assuming ids_to_name is already a data frame with 'id' and 'name'
+final_rankings <- lapply(final_rankings, function(df) {
+  df %>% 
+    mutate(player_id = as.factor(player_id)) %>%
+    left_join(ids_to_name %>% mutate(id = as.factor(id)), by = c("player_id" = "id"))
+})
+
+```
+
+
+
+```{R}
+
+defensive_indices <- c(3, 4)
+defensive_roles <- c("BH Defender", "Screen Defender")
+
+# Plotting function for defenders
+plot_defensive_rankings <- function(df, role_label) {
+  
+  # Sorting: Reorder names by -EPA to put lowest (best) EPA at the top
+  df$name <- reorder(df$name, -df$expected_points_added)
+  
+  ggplot(df, aes(x = expected_points_added, y = name, color = rank_group)) +
+    geom_point(size = 3) +
+    geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0.2) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black", alpha = 0.5) +
+    theme_minimal() +
+    # Ensure Top 5 (Best/Low EPA) and Bottom 5 (Worst/High EPA) are visually distinct
+    scale_color_manual(values = c("Top 5" = "#0072B2", "Bottom 5" = "#D55E00")) +
+    labs(
+      title = paste("Defensive EPA Rankings:", role_label),
+      subtitle = "Top 5 (Lowest EPA) vs Bottom 5 (Highest EPA)",
+      x = "Expected Points Added (EPA)",
+      y = "Player Name",
+      color = "Performance Rank"
+    ) +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+# Generate plots
+for (i in seq_along(defensive_indices)) {
+  df_idx <- defensive_indices[i]
+  role_name <- defensive_roles[i]
+  
+  p <- plot_defensive_rankings(final_rankings[[df_idx]], role_name)
+  print(p)
+}
+```
+
+
+```{R}
+
+fixed_effects_summary <- summary(screen_model)$coefficients
+
+# Filter for the screen_type variables
+# Assumes your model output contains variables like "screen_typehedge", 
+# "screen_typeswitch", etc.
+screen_type_effects <- data.frame(
+  screen_type = rownames(fixed_effects_summary),
+  estimate = fixed_effects_summary[, "Estimate"]
+) %>%
+  filter(grepl("screen_type", screen_type))
+
+# Re-calculate the absolute impact for each type
+# The intercept represents the reference level
+intercept <- fixed_effects_summary["(Intercept)", "Estimate"]
+
+screen_type_effects <- screen_type_effects %>%
+  mutate(
+    # Clean the name to remove "screen_type"
+    screen_type = gsub("screen_type", "", screen_type),
+    # Calculate the total effect
+    # Note: If the reference level is not in the coefficients table, 
+    # you may need to add a row manually for the intercept value itself.
+    total_impact = intercept + estimate
+  ) %>%
+  arrange(-total_impact)
+```
+
+
+
+##Old Approach rankings
+
+```{R}
+all_screens = read.csv("all_screens.csv")
+all_screens = all_screens %>% filter(!(shot_type %in% c("heave", "hook")) & screen_defense != "None")
+all_screens$screener_id <- as.factor(all_screens$screener_id)
+all_screens$screen_bh   <- as.factor(all_screens$screen_bh)
+all_screens$screen_bhd  <- as.factor(all_screens$screen_bhd)
+all_screens$screen_scrd <- as.factor(all_screens$screen_scrd)
+all_screens$shot_type <- as.factor(all_screens$shot_type)
+all_screens$shot_contest_type <- as.factor(all_screens$shot_contest_type)
+all_screens$screen_defense <- as.factor(all_screens$screen_defense)
+all_screens$make = as.factor(all_screens$make)
+screen_model = lmer(xpt ~ shot_distance + screen_type + screen_defense + shot_contest_type +
+              (1 | screener_id) + 
+              (1 | screen_bh) + 
+              (1 | screen_bhd) + 
+              (1 | screen_scrd), 
+              data = all_screens)
+screener_effects <- ranef(screen_model)$screener_id
+
+screener_rankings = data.frame(
+  screener_id = rownames(screener_effects),
+  impact_coefficient = screener_effects$`(Intercept)`
+)
+screener_rankings <- screener_rankings[order(-screener_rankings$impact_coefficient), ] %>% mutate(screener_id = as.integer(screener_id)) %>% left_join(ids_to_name, by = c("screener_id" = "id"))
+screener_rankings %>% arrange(impact_coefficient %>% desc()) %>% head(10)
+```
+
+
+
+
+
+
+```{R}
+
+screener_d_effects <- ranef(screen_model)$screen_scrd
+
+screener_d_rankings = data.frame(
+  screen_scrd = rownames(screener_d_effects),
+  impact_coefficient = screener_d_effects$`(Intercept)`
+)
+screener_d_rankings <- screener_d_rankings[order(-screener_d_rankings$impact_coefficient), ] %>% mutate(screen_scrd = as.integer(screen_scrd)) %>% left_join(ids_to_name, by = c("screen_scrd" = "id"))
+head(screener_d_rankings, 10)
+```
+
+
+
+
+```{R}
+all_effects <- ranef(screen_model)
+
+get_rankings <- function(role_name) {
+  df_role <- data.frame(
+    player_id = rownames(all_effects[[role_name]]),
+    impact_coefficient = all_effects[[role_name]][["(Intercept)"]]
+  )
+  return(df_role[order(-df_role$impact_coefficient), ])
+}
+rankings_screener <- get_rankings("screener_id")
+rankings_bh       <- get_rankings("screen_bh")   
+rankings_bhd <- get_rankings("screen_bhd")
+rankings_bhd <- rankings_bhd[order(rankings_bhd$impact_coefficient), ]
+
+rankings_scrd <- get_rankings("screen_scrd")
+rankings_scrd <- rankings_scrd[order(rankings_scrd$impact_coefficient), ]
+
+rankings_screener <- rankings_screener %>% 
+  mutate(player_id = as.integer(player_id)) %>% 
+  left_join(ids_to_name, by = c("player_id" = "id"))
+
+rankings_bh <- rankings_bh %>% 
+  mutate(player_id = as.integer(player_id)) %>% 
+  left_join(ids_to_name, by = c("player_id" = "id"))
+
+rankings_bhd <- rankings_bhd %>% 
+  mutate(player_id = as.integer(player_id)) %>% 
+  left_join(ids_to_name, by = c("player_id" = "id"))
+
+rankings_scrd <- rankings_scrd %>% 
+  mutate(player_id = as.integer(player_id)) %>% 
+  left_join(ids_to_name, by = c("player_id" = "id"))
+
+
+
+```
+
+
+
+
+
+
+```{R}
+library(performance)
+check_model(screen_model)
+
+```
+
+
+
+
+
+```{R}
+
+fixed_effects_summary <- summary(screen_model)$coefficients
+
+# Filter for the screen_defense variables
+# 'screen_defense' will be expanded into multiple rows (one for each type)
+# The first level (e.g., "drop") is usually the intercept, 
+# and the others are deviations from it.
+screen_type_effects <- data.frame(
+  screen_type = rownames(fixed_effects_summary),
+  estimate = fixed_effects_summary[, "Estimate"]
+) %>%
+  filter(grepl("screen_defense", screen_type))
+
+# Re-calculate the absolute impact for each type
+# The intercept represents the reference level (the first alphabetical level)
+# We add the intercept to the deviations to get the true effect
+intercept <- fixed_effects_summary["(Intercept)", "Estimate"]
+screen_type_effects <- screen_type_effects %>%
+  mutate(
+    # Clean the name to remove "screen_defense"
+    screen_type = gsub("screen_defense", "", screen_type),
+    # Calculate the total effect
+    total_impact = intercept + estimate
+  ) %>%
+  arrange(-total_impact)
+```
+
+
+
+
+```{R}
+fixed_effects_summary <- summary(screen_model)$coefficients
+
+# Filter for the screen_type variables
+# Assumes your model output contains variables like "screen_typehedge", 
+# "screen_typeswitch", etc.
+screen_type_effects <- data.frame(
+  screen_type = rownames(fixed_effects_summary),
+  estimate = fixed_effects_summary[, "Estimate"]
+) %>%
+  filter(grepl("screen_type", screen_type))
+
+# Re-calculate the absolute impact for each type
+# The intercept represents the reference level
+intercept <- fixed_effects_summary["(Intercept)", "Estimate"]
+
+screen_type_effects <- screen_type_effects %>%
+  mutate(
+    # Clean the name to remove "screen_type"
+    screen_type = gsub("screen_type", "", screen_type),
+    # Calculate the total effect
+    # Note: If the reference level is not in the coefficients table, 
+    # you may need to add a row manually for the intercept value itself.
+    total_impact = intercept + estimate
+  ) %>%
+  arrange(-total_impact)
+```
+
+
+```{R}
+
+library(ggplot2)
+library(ggrepel)
+library(ggExtra)
+
+# Prepare the data
+comparison_df <- rankings_bh %>%
+  rename(bh_impact = impact_coefficient) %>%
+  left_join(rankings_screener %>% select(player_id, impact_coefficient), by = "player_id") %>%
+  rename(screener_impact = impact_coefficient)
+
+# Define specific players to label
+players_to_label <- c("Stephen Curry", "Nikola Jokic", "Draymond Green", "LeBron James")
+
+# Create the scatterplot
+p <- ggplot(comparison_df, aes(x = bh_impact, y = screener_impact)) +
+  geom_point(alpha = 0.5, color = "midnightblue") +
+  geom_text_repel(data = subset(comparison_df, name %in% players_to_label),
+                  aes(label = name), box.padding = 0.5) +
+  labs(title = "Player Impact: Ball Handling vs. Screening",
+       x = "Ball Handler Impact (Random Effect)",
+       y = "Screener Impact (Random Effect)") +
+  theme_minimal()
+
+# Add histograms to the axes
+ggMarginal(p, type = "histogram", fill = "steelblue", color = "white")
+```
+
+
+
+
+```{R}
+var_comp <- as.data.frame(VarCorr(screen_model))
+
+# 2. Filter out Residual and calculate Relative ICC
+relative_icc_data <- var_comp %>%
+  filter(grp != "Residual") %>%
+  mutate(grp = recode(grp, "screen_bh" = "Ball Handler", 
+                           "screener_id" = "Screener", 
+                           "screen_scrd" = "Screener Def", 
+                           "screen_bhd" = "BH Def")) %>%
+  mutate(relative_percent = (vcov / sum(vcov)) * 100)
+
+# 3. Plot
+ggplot(relative_icc_data, aes(x = reorder(grp, relative_percent), y = relative_percent, fill = grp)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Relative Variance Partitioning",
+       subtitle = "Proportion of player-attributable variation by role",
+       x = "Player Role", y = "Relative ICC (%)") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+```
+
+```{R}
+top_10 <- rankings_screener %>%
+  slice_max(impact_coefficient, n = 10)
+
+bottom_10 <- rankings_screener %>%
+  slice_min(impact_coefficient, n = 10)
+
+plot_data <- bind_rows(top_10, bottom_10) %>%
+  # Arrange so the plot displays from highest to lowest
+  arrange(impact_coefficient) %>%
+  mutate(name = factor(name, levels = name))
+
+# 2. Create the Plot
+ggplot(plot_data, aes(x = name, y = impact_coefficient, fill = impact_coefficient > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() + # Makes it a horizontal bar chart
+  scale_fill_manual(values = c("TRUE" = "#2ecc71", "FALSE" = "#e74c3c"), 
+                    guide = "none") +
+  # Add the labels on the bars
+  geom_text(aes(label = round(impact_coefficient, 4)), 
+            hjust = ifelse(plot_data$impact_coefficient > 0, -0.1, 1.1),
+            size = 3) +
+  labs(title = "Top 10 and Bottom 10 Screeners by Impact Coefficient",
+       subtitle = "Random effect estimates controlling for situation",
+       x = "Player Name",
+       y = "Impact Coefficient (Deviation from Average)") +
+  theme_minimal() +
+  # Expand y-axis limits to make room for labels
+  scale_y_continuous(expand = expansion(mult = c(0.2, 0.2)))
+```
